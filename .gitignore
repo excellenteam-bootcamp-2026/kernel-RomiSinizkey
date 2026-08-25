@@ -1,0 +1,9 @@
+# Linux Kernel Module build files
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+Cyber Security Project 10 - 2026.pdf
