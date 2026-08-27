@@ -52,24 +52,36 @@ static bool is_blocked_destination(__be32 ip)
 
 static unsigned int firewall_hook_fn(
     void *priv,
-    struct sk_buff *skb, 
-    const struct  nf_hook_state *state)
+    struct sk_buff *skb,
+    const struct nf_hook_state *state)
 {
     struct iphdr *ip_header;
 
-    if(!skb)
-       return NF_ACCEPT;
-      
-     ip_header = ip_hdr(skb);
+    if (!skb)
+        return NF_ACCEPT;
+
+    ip_header = ip_hdr(skb);
 
     if (!ip_header)
         return NF_ACCEPT;
-    
-    if (is_blocked_source(ip_header->saddr))
-        return NF_DROP;
 
-    if (is_blocked_destination(ip_header->daddr))
+    if (is_blocked_source(ip_header->saddr)) {
+        pr_info_ratelimited(
+            "firewall_module: dropping packet from %pI4\n",
+            &ip_header->saddr
+        );
+
         return NF_DROP;
+    }
+
+    if (is_blocked_destination(ip_header->daddr)) {
+        pr_info_ratelimited(
+            "firewall_module: dropping packet to %pI4\n",
+            &ip_header->daddr
+        );
+
+        return NF_DROP;
+    }
 
     return NF_ACCEPT;
 }
