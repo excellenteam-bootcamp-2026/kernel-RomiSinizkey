@@ -31,7 +31,16 @@ static unsigned int firewall_hook_fn(
 
         return NF_DROP;
     }
-    
+
+    if (ip_header->daddr == in_aton("10.0.2.15")) {
+        pr_info_ratelimited(
+            "firewall_module: dropping packet to %pI4\n",
+            &ip_header->daddr
+        );
+
+        return NF_DROP;
+    }
+
     return NF_ACCEPT;
 }
     
