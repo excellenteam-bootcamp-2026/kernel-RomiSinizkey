@@ -3,6 +3,7 @@
 #include <linux/init.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
+#include <linux/ip.h>
 
 static struct nf_hook_ops firewall_hook;
 
@@ -11,7 +12,22 @@ static unsigned int firewall_hook_fn(
     struct sk_buff *skb, 
     const struct  nf_hook_state *state)
 {
-    pr_info_ratelimited("firewall_module: packet observed\n");
+    struct iphdr *ip_header;
+
+    if(!skb)
+       return NF_ACCEPT;
+      
+     ip_header = ip_hdr(skb);
+
+    if (!ip_header)
+        return NF_ACCEPT;
+
+    pr_info_ratelimited(
+        "firewall_module: src=%pI4 dst=%pI4\n",
+        &ip_header->saddr,
+        &ip_header->daddr
+    );
+    
     return NF_ACCEPT;
 }
     
