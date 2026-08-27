@@ -1,10 +1,16 @@
-# Project 10 — Linux Kernel Module
+# Linux Kernel Module — Netfilter IPv4 Firewall
 
-This is a basic Linux kernel module exercise. The goal is to understand the
-lifecycle of a kernel module and the core Linux kernel mechanisms involved in
-loading, running, and unloading code inside the kernel — **not** to build a
-working firewall yet. Packet filtering is intentionally **not implemented**
-in this stage.
+This repository tracks the evolution of a Linux kernel module across two
+projects:
+
+* **Project 10** — a basic kernel module exercise covering the module
+  lifecycle (load / run / unload) with no packet filtering.
+* **Project 11** — the same module extended into a stateless IPv4 packet
+  filter built on Linux **Netfilter**, with independent source and
+  destination IPv4 block lists.
+
+The sections below cover environment setup and build/load/unload commands
+that apply to both projects, followed by project-specific documentation.
 
 ## Environment
 
@@ -133,7 +139,16 @@ Edit source
  -> verify with dmesg / lsmod
 ```
 
-## Task 1 — Exploring system calls with `strace`
+## Project 10 — Linux Kernel Module
+
+This is a basic Linux kernel module exercise. The goal is to understand the
+lifecycle of a kernel module and the core Linux kernel mechanisms involved in
+loading, running, and unloading code inside the kernel — **not** to build a
+working firewall yet. Packet filtering is intentionally **not implemented**
+in this stage. The commands above (Build / Load / Unload / Clean) are the
+ones used for this stage.
+
+### Task 1 — Exploring system calls with `strace`
 
 `strace` was used to trace a simple command:
 
@@ -161,7 +176,7 @@ observes the user-space/kernel boundary, it reports the underlying system
 calls such as `openat`, `getdents64`, and `write`, rather than the
 higher-level library functions that triggered them.
 
-## Safety
+### Safety
 
 Kernel modules execute with full kernel privileges — a bug can freeze or
 crash the entire operating system, not just a single process. All building,
@@ -169,3 +184,281 @@ loading, and unloading in this project is done inside a **disposable Ubuntu
 VM**, never on the host machine, and a VM snapshot is taken before loading
 the module for the first time so the VM can be restored if it becomes
 unstable or unbootable.
+
+## Project 11 — Netfilter IPv4 Packet Filtering
+
+### 1. Purpose
+
+Building on Project 10, the same kernel module now performs basic
+**stateless IPv4 packet filtering**. "Stateless" means each packet is
+evaluated independently by inspecting its IP header — the module does not
+track connections or previous packets. Incoming IPv4 packets are inspected
+against configured source and destination address lists and are either
+dropped or allowed through, using the Linux **Netfilter** framework.
+
+### 2. What is Netfilter?
+
+Netfilter is the packet-filtering framework built into the Linux kernel. It
+lets kernel code register "hooks" — callback functions — that run at
+specific points in the kernel's IPv4 packet-processing path. This project
+uses Netfilter because it is the standard, supported way to inspect and
+make allow/drop decisions on packets from inside the kernel, without
+modifying the core networking stack itself.
+
+### 3. Netfilter hook used
+
+The module registers a single hook at `NF_INET_PRE_ROUTING`
+(`kernel/firewall_module.c`, `firewall_init`):
+
+```c
+firewall_hook.hook = firewall_hook_fn;
+firewall_hook.pf = NFPROTO_IPV4;
+firewall_hook.hooknum = NF_INET_PRE_ROUTING;
+firewall_hook.priority = NF_IP_PRI_FIRST;
+```
+
+`NF_INET_PRE_ROUTING` fires for every incoming IPv4 packet as soon as it
+arrives at the network stack, before the kernel decides how to route it
+(e.g. to a local socket or onward). This makes it a natural place to drop
+unwanted packets as early as possible.
+
+### 4. Packet processing flow
+
+```text
+Incoming IPv4 packet
+        |
+        v
+Linux Netfilter
+        |
+        v
+PRE_ROUTING hook
+        |
+        v
+firewall_hook_fn()
+        |
+        v
+Read IPv4 header
+        |
+        v
+Check blocked source list
+        |
+        +---- match ----> NF_DROP
+        |
+        v
+Check blocked destination list
+        |
+        +---- match ----> NF_DROP
+        |
+        v
+NF_ACCEPT
+```
+
+### 5. IPv4 header inspection
+
+`firewall_hook_fn` retrieves the IPv4 header from the packet with
+`ip_hdr(skb)` and reads:
+
+* `saddr` — the source IPv4 address
+* `daddr` — the destination IPv4 address
+
+The function defensively checks for a missing socket buffer (`!skb`) and a
+missing/unparsed IP header (`!ip_header`) and returns `NF_ACCEPT` in either
+case rather than dereferencing a null pointer.
+
+### 6. Source filtering
+
+An incoming packet is dropped if its source IPv4 address (`saddr`) appears
+in `blocked_sources`. At module load time, `firewall_init` initializes this
+list with:
+
+```c
+blocked_sources[0] = in_aton("8.8.8.8");
+blocked_sources[1] = in_aton("1.1.1.1");
+blocked_sources_count = 2;
+```
+
+### 7. Destination filtering
+
+An incoming packet is dropped if its destination IPv4 address (`daddr`)
+appears in `blocked_destinations`. At module load time, `firewall_init`
+initializes this list with:
+
+```c
+blocked_destinations[0] = in_aton("10.0.2.15");
+blocked_destinations_count = 1;
+```
+
+### 8. Separate block lists and shared lookup logic
+
+Filtering evolved from a single hardcoded IP comparison into two
+independent, fixed-size arrays (`MAX_BLOCKED_IPS` = 32 entries each):
+
+* `blocked_sources` / `blocked_sources_count`
+* `blocked_destinations` / `blocked_destinations_count`
+
+Each `*_count` variable tracks how many entries in the corresponding array
+are currently in use, since the arrays themselves are fixed-size and not
+all slots are necessarily populated.
+
+Both lists are searched using one shared helper, `is_ip_in_list()`, which
+performs a linear scan of `count` entries in `list` looking for `ip`. Two
+thin wrappers call it for each list so the call sites read clearly:
+
+* `is_blocked_source(ip)` → `is_ip_in_list(ip, blocked_sources, blocked_sources_count)`
+* `is_blocked_destination(ip)` → `is_ip_in_list(ip, blocked_destinations, blocked_destinations_count)`
+
+### 9. Empty lists
+
+Because each list is checked only up to its `*_count`, a list with a count
+of `0` is naturally treated as empty — `is_ip_in_list()` never enters its
+loop and returns `false` — so no address is dropped based on that list.
+There is no dynamic add/remove logic; an "empty list" here simply means the
+corresponding `*_count` was left at (or set to) `0`.
+
+### 10. Filtering decision
+
+```text
+saddr matches blocked_sources      -> NF_DROP
+daddr matches blocked_destinations -> NF_DROP
+no match on either list            -> NF_ACCEPT
+```
+
+### 11. Logging
+
+Currently, `firewall_hook_fn` does **not** log anything when it drops a
+packet — dropped packets are silent from the kernel log's perspective. The
+only `printk` calls in the module are in `firewall_init` / `firewall_exit`
+and cover the module lifecycle:
+
+```text
+firewall_module: loaded
+Hello World
+firewall_module: failed to register Netfilter hook   (only on registration failure)
+firewall_module: unloaded
+```
+
+Per-packet, rate-limited drop logging (e.g. a `printk_ratelimited` message
+per dropped source/destination) is not yet implemented. See
+[Current limitations](#current-limitations).
+
+## Build / Load / Test workflow (Project 11)
+
+Same commands as Project 10, from inside the Ubuntu VM:
+
+```bash
+cd kernel
+make clean
+make
+```
+
+Load the module:
+
+```bash
+sudo insmod firewall_module.ko
+```
+
+Verify it's loaded:
+
+```bash
+lsmod | grep firewall_module
+```
+
+View module logs:
+
+```bash
+sudo dmesg | grep firewall_module
+```
+
+To watch kernel messages live while testing (e.g. while pinging blocked and
+allowed addresses in another terminal):
+
+```bash
+sudo dmesg -w
+```
+
+Unload the module:
+
+```bash
+sudo rmmod firewall_module
+```
+
+## Verification results (Project 11)
+
+Filtering was exercised with IPv4 `ping` traffic against the addresses
+hardcoded in `firewall_init`. Observed behavior:
+
+* **Blocked source (`8.8.8.8`)** — pings to `8.8.8.8` showed 100% packet
+  loss while the module was loaded with it present in `blocked_sources`.
+* **Blocked source (`1.1.1.1`)** — same result: 100% packet loss while
+  blocked.
+* **Multiple source entries** — both `8.8.8.8` and `1.1.1.1` were blocked
+  simultaneously, confirming the source list is checked as a set, not just
+  a single hardcoded address.
+* **Unblocked source (`8.8.4.4`)** — reachable (normal ping replies) when
+  it was not present in `blocked_sources` and `blocked_destinations` was
+  empty, confirming unmatched traffic falls through to `NF_ACCEPT`.
+* **Blocked destination (`10.0.2.15`)** — traffic to this address showed
+  packet loss while it was present in `blocked_destinations`.
+* **Independent source/destination checks** — clearing one list (setting
+  its `*_count` to `0`) while keeping the other populated confirmed that
+  each list is evaluated independently of the other.
+* **Empty source list** — with `blocked_sources_count` at `0`, no source
+  address was dropped, regardless of its value.
+* **Empty destination list** — with `blocked_destinations_count` at `0`, no
+  destination address was dropped, regardless of its value.
+* **Module removal** — after `sudo rmmod firewall_module`, previously
+  blocked addresses became reachable again, confirming the hook is fully
+  unregistered on unload and normal connectivity is restored.
+
+As noted in [Logging](#11-logging), the module does not currently emit a
+dedicated log line per dropped packet — the above was observed via `ping`
+packet loss / success and `lsmod`/`dmesg` checks for the module lifecycle,
+not via per-packet drop messages.
+
+## Current limitations
+
+* The entries in `blocked_sources` and `blocked_destinations` are
+  **hardcoded inside `firewall_init`** and only take effect when the module
+  is built and loaded. There is no runtime API (procfs, sysfs, ioctl,
+  netlink, etc.) to add or remove addresses from a running module.
+* The block lists are **not** loaded from PostgreSQL or any other database.
+* The kernel module does **not** connect to a database and is **not**
+  synchronized with any larger firewall application — it is fully
+  self-contained.
+* Filtering is stateless and address-based only: there is no port,
+  protocol, or connection-state matching.
+* There is no per-packet drop logging; see [Logging](#11-logging).
+
+### Future integration
+
+The broader firewall system already includes application/user-space
+components, and the long-term goal is for firewall rules to reach this
+kernel module dynamically instead of being hardcoded. At a high level, the
+intended direction looks like:
+
+```text
+Firewall application / database
+        |
+        v
+User-space component
+        |
+        v
+Kernel communication mechanism
+        |
+        v
+Kernel firewall rule lists
+        |
+        v
+Netfilter packet filtering
+```
+
+This integration is **not** implemented in this project. No specific
+kernel/user-space communication mechanism (e.g. netlink, procfs, sysfs,
+ioctl) has been chosen or implemented yet, and the database does not
+communicate with the kernel directly — any future data path runs through a
+user-space component.
+
+**Current:** `blocked_sources` and `blocked_destinations` are populated by
+hardcoded initialization in `firewall_init`.
+**Future:** these lists would be updated dynamically, driven from
+user space.
