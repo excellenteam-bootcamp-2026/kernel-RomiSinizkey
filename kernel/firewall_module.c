@@ -4,6 +4,7 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/ip.h>
+#include <linux/inet.h>
 
 static struct nf_hook_ops firewall_hook;
 
@@ -21,12 +22,15 @@ static unsigned int firewall_hook_fn(
 
     if (!ip_header)
         return NF_ACCEPT;
+    
+    if (ip_header->saddr == in_aton("8.8.8.8")) {
+        pr_info_ratelimited(
+            "firewall_module: dropping packet from %pI4\n",
+            &ip_header->saddr
+        );
 
-    pr_info_ratelimited(
-        "firewall_module: src=%pI4 dst=%pI4\n",
-        &ip_header->saddr,
-        &ip_header->daddr
-    );
+        return NF_DROP;
+    }
     
     return NF_ACCEPT;
 }
