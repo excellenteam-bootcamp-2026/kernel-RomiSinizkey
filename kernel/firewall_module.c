@@ -8,6 +8,48 @@
 
 static struct nf_hook_ops firewall_hook;
 
+#define MAX_BLOCKED_IPS 32
+
+static __be32 blocked_sources[MAX_BLOCKED_IPS];
+static unsigned int blocked_sources_count = 0;
+
+static __be32 blocked_destinations[MAX_BLOCKED_IPS];
+static unsigned int blocked_destinations_count = 0;
+
+static bool is_ip_in_list(
+    __be32 ip,
+    const __be32 *list,
+    unsigned int count)
+{
+    unsigned int i;
+
+    for (i = 0; i < count; i++) {
+        if (ip == list[i])
+            return true;
+    }
+
+    return false;
+}
+
+static bool is_blocked_source(__be32 ip)
+{
+    return is_ip_in_list(
+        ip,
+        blocked_sources,
+        blocked_sources_count
+    );
+}
+
+static bool is_blocked_destination(__be32 ip)
+{
+    return is_ip_in_list(
+        ip,
+        blocked_destinations,
+        blocked_destinations_count
+    );
+}
+
+
 static unsigned int firewall_hook_fn(
     void *priv,
     struct sk_buff *skb, 
@@ -23,7 +65,7 @@ static unsigned int firewall_hook_fn(
     if (!ip_header)
         return NF_ACCEPT;
     
-    if (ip_header->saddr == in_aton("8.8.8.8")) {
+    if (is_blocked_source(ip_header->saddr)) {
         pr_info_ratelimited(
             "firewall_module: dropping packet from %pI4\n",
             &ip_header->saddr
@@ -32,7 +74,7 @@ static unsigned int firewall_hook_fn(
         return NF_DROP;
     }
 
-    if (ip_header->daddr == in_aton("10.0.2.15")) {
+    if (is_blocked_destination(ip_header->daddr)) {
         pr_info_ratelimited(
             "firewall_module: dropping packet to %pI4\n",
             &ip_header->daddr
@@ -52,6 +94,13 @@ static int __init firewall_init(void)
 
     printk(KERN_INFO "firewall_module: loaded\n");
     printk(KERN_INFO "Hello World\n");
+
+    blocked_sources[0] = in_aton("8.8.8.8");
+    blocked_sources[1] = in_aton("1.1.1.1");
+    blocked_sources_count = 2;
+
+    blocked_destinations[0] = in_aton("10.0.2.15");
+    blocked_destinations_count = 1;
 
     firewall_hook.hook = firewall_hook_fn;
     firewall_hook.pf = NFPROTO_IPV4;
