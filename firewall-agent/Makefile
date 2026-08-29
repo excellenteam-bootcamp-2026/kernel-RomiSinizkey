@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra
+CFLAGS = -Wall -Wextra -I../shared
 
 TARGET = firewall-agent
 SRCS = main.c

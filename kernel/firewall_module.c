@@ -6,6 +6,8 @@
 #include <linux/ip.h>
 #include <linux/inet.h>
 
+#include "firewall_protocol.h"
+
 static struct nf_hook_ops firewall_hook;
 
 #define MAX_BLOCKED_IPS 32
