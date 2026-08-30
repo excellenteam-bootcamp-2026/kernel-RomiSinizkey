@@ -7,6 +7,7 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/errno.h>
+#include <net/genetlink.h>
 
 #include "firewall_protocol.h"
 
@@ -103,12 +104,63 @@ static int __maybe_unused firewall_replace_ruleset(const __be32 *ips, unsigned i
     return 0;
 }
 
+/* Top-level Generic Netlink attribute policy for this family.
+ * FIREWALL_A_RULE_LIST is a nested attribute; its inner FIREWALL_RULE_A_*
+ * contents are not parsed or validated at this step.
+ */
+static const struct nla_policy firewall_genl_policy[FIREWALL_A_MAX + 1] = {
+    [FIREWALL_A_RULE_LIST] = { .type = NLA_NESTED },
+};
+
+/*
+ * Handler for FIREWALL_CMD_REPLACE_RULES.
+ *
+ * For this step, this only confirms that a rule list attribute was sent
+ * and acknowledges the request. It does not parse individual rules and
+ * does not call firewall_replace_ruleset() - the active ruleset, and
+ * therefore packet filtering behavior, is unchanged by this handler.
+ */
+static int firewall_genl_replace_rules(struct sk_buff *skb, struct genl_info *info)
+{
+    if (!info->attrs[FIREWALL_A_RULE_LIST])
+        return -EINVAL;
+
+    pr_info_ratelimited("firewall_module: received REPLACE_RULES request\n");
+
+    return 0;
+}
+
+static const struct genl_ops firewall_genl_ops[] = {
+    {
+        .cmd = FIREWALL_CMD_REPLACE_RULES,
+        .doit = firewall_genl_replace_rules,
+        .flags = GENL_ADMIN_PERM,
+    },
+};
+
+static struct genl_family firewall_genl_family = {
+    .name = FIREWALL_GENL_FAMILY_NAME,
+    .version = FIREWALL_GENL_VERSION,
+    .maxattr = FIREWALL_A_MAX,
+    .policy = firewall_genl_policy,
+    .module = THIS_MODULE,
+    .ops = firewall_genl_ops,
+    .n_ops = ARRAY_SIZE(firewall_genl_ops),
+};
+
 static int __init firewall_init(void)
 {
     int result;
 
     printk(KERN_INFO "firewall_module: loaded\n");
     printk(KERN_INFO "Hello World\n");
+
+    result = genl_register_family(&firewall_genl_family);
+
+    if (result != 0) {
+        printk(KERN_ERR "firewall_module: failed to register Generic Netlink family\n");
+        return result;
+    }
 
     firewall_hook.hook = firewall_hook_fn;
     firewall_hook.pf = NFPROTO_IPV4;
@@ -119,6 +171,7 @@ static int __init firewall_init(void)
 
     if(result != 0){
         printk(KERN_ERR "firewall_module: failed to register Netfilter hook\n");
+        genl_unregister_family(&firewall_genl_family);
         return result;
     }
     return 0;
@@ -127,7 +180,7 @@ static int __init firewall_init(void)
 static void __exit firewall_exit(void)
 {
     nf_unregister_net_hook(&init_net, &firewall_hook);
-
+    genl_unregister_family(&firewall_genl_family);
 
     printk(KERN_INFO "firewall_module: unloaded\n");
 }
