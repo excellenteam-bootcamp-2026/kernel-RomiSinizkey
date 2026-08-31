@@ -19,8 +19,9 @@ struct firewall_ruleset {
 };
 
 /* Active ruleset enforced by the Netfilter hook. Starts empty (all-zero)
- * until a future Generic Netlink handler calls firewall_replace_ruleset().
- * Until then, every packet is accepted - this is expected.
+ * until the Generic Netlink REPLACE_RULES handler calls
+ * firewall_replace_ruleset(). Until a valid message arrives, every
+ * packet is accepted - this is expected.
  */
 static struct firewall_ruleset active_ruleset;
 static DEFINE_RWLOCK(ruleset_lock);
@@ -75,26 +76,33 @@ static unsigned int firewall_hook_fn(
 }
 
 /*
- * Install a complete replacement ruleset, to be called by the future
- * Generic Netlink REPLACE_RULES handler once rule type/mode validation
- * has already happened. This helper only enforces the count bound and
- * performs the atomic swap - it does not parse or validate rule fields.
+ * Install a complete replacement ruleset, called only after the caller
+ * has already validated every rule (type == IP, mode == blacklist).
+ * This helper enforces the count bound and performs the atomic swap.
  *
  * The replacement is built up locally first and only copied into the
  * active ruleset while holding the write lock, so readers never observe
  * a partially updated ruleset and a rejected call leaves the previously
  * active ruleset completely untouched.
  *
- * Returns 0 on success, -EINVAL if count exceeds FIREWALL_MAX_RULES.
+ * count == 0 installs an empty ruleset (ips may be NULL in that case).
+ * Returns 0 on success, -EINVAL if count exceeds FIREWALL_MAX_RULES or
+ * if count > 0 but ips is NULL.
  */
-static int __maybe_unused firewall_replace_ruleset(const __be32 *ips, unsigned int count)
+static int firewall_replace_ruleset(const __be32 *ips, unsigned int count)
 {
-    struct firewall_ruleset new_ruleset;
+    struct firewall_ruleset new_ruleset = { 0 };
 
     if (count > FIREWALL_MAX_RULES)
         return -EINVAL;
 
-    memcpy(new_ruleset.blocked_ips, ips, count * sizeof(*ips));
+    if (count > 0) {
+        if (!ips)
+            return -EINVAL;
+
+        memcpy(new_ruleset.blocked_ips, ips, count * sizeof(*ips));
+    }
+
     new_ruleset.count = count;
 
     write_lock_bh(&ruleset_lock);
@@ -105,27 +113,81 @@ static int __maybe_unused firewall_replace_ruleset(const __be32 *ips, unsigned i
 }
 
 /* Top-level Generic Netlink attribute policy for this family.
- * FIREWALL_A_RULE_LIST is a nested attribute; its inner FIREWALL_RULE_A_*
- * contents are not parsed or validated at this step.
+ * FIREWALL_A_RULE_LIST is a nested attribute; each nested child is
+ * itself parsed against firewall_rule_policy below.
  */
 static const struct nla_policy firewall_genl_policy[FIREWALL_A_MAX + 1] = {
     [FIREWALL_A_RULE_LIST] = { .type = NLA_NESTED },
 };
 
+/* Per-rule attribute policy, used to parse each nested rule entry. */
+static const struct nla_policy firewall_rule_policy[FIREWALL_RULE_A_MAX + 1] = {
+    [FIREWALL_RULE_A_ID]    = { .type = NLA_U32 },
+    [FIREWALL_RULE_A_TYPE]  = { .type = NLA_U8 },
+    [FIREWALL_RULE_A_MODE]  = { .type = NLA_U8 },
+    [FIREWALL_RULE_A_VALUE] = { .type = NLA_U32 },
+};
+
 /*
  * Handler for FIREWALL_CMD_REPLACE_RULES.
  *
- * For this step, this only confirms that a rule list attribute was sent
- * and acknowledges the request. It does not parse individual rules and
- * does not call firewall_replace_ruleset() - the active ruleset, and
- * therefore packet filtering behavior, is unchanged by this handler.
+ * Parses FIREWALL_A_RULE_LIST as a nested list of rules, validating each
+ * one against the fields this stage supports (IPv4 blacklist only). The
+ * entire message is rejected - and the active ruleset left untouched -
+ * if any rule is missing a required field, uses an unsupported type or
+ * mode, is malformed, or the total count exceeds FIREWALL_MAX_RULES.
+ *
+ * The validated addresses are collected into a local array first; only
+ * once every rule has passed validation is firewall_replace_ruleset()
+ * called to publish the new snapshot.
  */
 static int firewall_genl_replace_rules(struct sk_buff *skb, struct genl_info *info)
 {
-    if (!info->attrs[FIREWALL_A_RULE_LIST])
+    struct nlattr *rule_list_attr = info->attrs[FIREWALL_A_RULE_LIST];
+    struct nlattr *rule_tb[FIREWALL_RULE_A_MAX + 1];
+    struct nlattr *rule_attr;
+    __be32 new_ips[FIREWALL_MAX_RULES];
+    unsigned int new_count = 0;
+    int rem;
+    int err;
+
+    if (!rule_list_attr)
         return -EINVAL;
 
-    pr_info_ratelimited("firewall_module: received REPLACE_RULES request\n");
+    nla_for_each_nested(rule_attr, rule_list_attr, rem) {
+        u8 type;
+        u8 mode;
+        u32 value;
+
+        if (new_count >= FIREWALL_MAX_RULES)
+            return -E2BIG;
+
+        err = nla_parse_nested(rule_tb, FIREWALL_RULE_A_MAX, rule_attr,
+                    firewall_rule_policy, NULL);
+        if (err)
+            return err;
+
+        if (!rule_tb[FIREWALL_RULE_A_TYPE] ||
+            !rule_tb[FIREWALL_RULE_A_MODE] ||
+            !rule_tb[FIREWALL_RULE_A_VALUE])
+            return -EINVAL;
+
+        type = nla_get_u8(rule_tb[FIREWALL_RULE_A_TYPE]);
+        mode = nla_get_u8(rule_tb[FIREWALL_RULE_A_MODE]);
+        value = nla_get_u32(rule_tb[FIREWALL_RULE_A_VALUE]);
+
+        if (type != FIREWALL_RULE_TYPE_IP || mode != FIREWALL_RULE_MODE_BLACKLIST)
+            return -EINVAL;
+
+        new_ips[new_count] = (__be32)value;
+        new_count++;
+    }
+
+    err = firewall_replace_ruleset(new_ips, new_count);
+    if (err)
+        return err;
+
+    pr_info("firewall_module: replaced active ruleset (%u IP rule(s) active)\n", new_count);
 
     return 0;
 }
