@@ -1,6 +1,7 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -I../shared $(shell pkg-config --cflags libnl-3.0 libnl-genl-3.0)
-LDLIBS = $(shell pkg-config --libs libnl-3.0 libnl-genl-3.0)
+PKGS = libnl-3.0 libnl-genl-3.0 libcurl libcjson
+CFLAGS = -Wall -Wextra -I../shared $(shell pkg-config --cflags $(PKGS))
+LDLIBS = $(shell pkg-config --libs $(PKGS))
 
 TARGET = firewall-agent
 SRCS = main.c
