@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
 #include <arpa/inet.h>
 
 #include <curl/curl.h>
@@ -25,6 +27,17 @@
  * never hardcoded to one deployment.
  */
 #define DEFAULT_RULES_URL "http://localhost:3000/api/firewall/rules?type=ip"
+
+/* Default polling interval, in seconds, used when FIREWALL_POLL_INTERVAL_SECONDS
+ * is unset or invalid. Matches the PDF's own suggested value for this stage.
+ */
+#define DEFAULT_POLL_INTERVAL_SECONDS 10
+
+/* Set only by handle_shutdown_signal(). sig_atomic_t + volatile is the
+ * one type safe to read/write both inside a signal handler and in
+ * normal code without extra synchronization.
+ */
+static volatile sig_atomic_t g_running = 1;
 
 struct http_response {
     char *data;
@@ -329,43 +342,125 @@ static int send_ruleset(struct nl_sock *sock, int family_id, const __be32 *ips, 
     return 0;
 }
 
-int main(void)
+/* Records that a shutdown was requested. Async-signal-safe: it only
+ * writes a sig_atomic_t, nothing else is safe to do here (no printf,
+ * no malloc/free, no libcurl/libnl calls).
+ */
+static void handle_shutdown_signal(int sig)
 {
-    struct nl_sock *sock = NULL;
+    (void)sig;
+    g_running = 0;
+}
+
+/*
+ * Installs the same handler for SIGINT (Ctrl+C) and SIGTERM (what
+ * systemd/kill send by default) so both request a clean shutdown the
+ * same way. SA_RESTART is deliberately not set: it makes a blocking
+ * sleep() return early (EINTR) as soon as a signal arrives instead of
+ * silently continuing to sleep out the rest of the interval, so the
+ * main loop notices g_running promptly.
+ */
+static void install_signal_handlers(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_shutdown_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
+
+/*
+ * Reads FIREWALL_POLL_INTERVAL_SECONDS, falling back to
+ * DEFAULT_POLL_INTERVAL_SECONDS if it is unset, not a valid number, or
+ * not positive - a bad env var should never crash the agent or produce
+ * a zero/negative sleep.
+ */
+static unsigned int poll_interval_seconds(void)
+{
+    const char *env = getenv("FIREWALL_POLL_INTERVAL_SECONDS");
+    char *endptr;
+    long value;
+
+    if (!env || !*env)
+        return DEFAULT_POLL_INTERVAL_SECONDS;
+
+    value = strtol(env, &endptr, 10);
+    if (*endptr != '\0' || value <= 0) {
+        fprintf(stderr,
+            "firewall-agent: invalid FIREWALL_POLL_INTERVAL_SECONDS \"%s\", using default (%d)\n",
+            env, DEFAULT_POLL_INTERVAL_SECONDS);
+        return DEFAULT_POLL_INTERVAL_SECONDS;
+    }
+
+    return (unsigned int)value;
+}
+
+/*
+ * Performs one fetch -> parse -> send cycle. Never terminates the
+ * agent on failure - fetch_rules()/parse_rules()/send_ruleset() each
+ * log their own error, and this function just returns a negative value
+ * so the caller retries on the next cycle. A fetch or parse failure
+ * returns before send_ruleset() is ever reached, so a bad or unreachable
+ * response can never replace the kernel's active ruleset.
+ */
+static int sync_once(struct nl_sock *sock, int family_id)
+{
     __be32 ips[FIREWALL_MAX_RULES];
     unsigned int count = 0;
     char *body = NULL;
+    int err;
+
+    err = fetch_rules(rules_url(), &body);
+    if (err != 0)
+        return err;
+
+    err = parse_rules(body, ips, &count);
+    free(body);
+    if (err != 0)
+        return err;
+
+    return send_ruleset(sock, family_id, ips, count);
+}
+
+int main(void)
+{
+    struct nl_sock *sock = NULL;
     int family_id = 0;
-    int exit_code = 1;
+    unsigned int interval;
 
     printf("firewall-agent started\n");
 
+    install_signal_handlers();
+    interval = poll_interval_seconds();
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    if (connect_netlink(&sock, &family_id) != 0)
-        goto out;
+    if (connect_netlink(&sock, &family_id) != 0) {
+        curl_global_cleanup();
+        return 1;
+    }
 
-    if (fetch_rules(rules_url(), &body) != 0)
-        goto out;
+    printf("firewall-agent: polling every %u second(s)\n", interval);
 
-    if (parse_rules(body, ips, &count) != 0)
-        goto out;
+    while (g_running) {
+        if (sync_once(sock, family_id) != 0)
+            fprintf(stderr, "firewall-agent: synchronization cycle failed, will retry\n");
+        else
+            printf("firewall-agent: synchronization cycle complete\n");
 
-    if (send_ruleset(sock, family_id, ips, count) != 0)
-        goto out;
+        if (!g_running)
+            break;
 
-    exit_code = 0;
+        sleep(interval);
+    }
 
-out:
-    free(body);
-    if (sock)
-        nl_socket_free(sock);
+    nl_socket_free(sock);
     curl_global_cleanup();
 
-    if (exit_code != 0)
-        fprintf(stderr, "firewall-agent: synchronization failed\n");
-    else
-        printf("firewall-agent: synchronization complete\n");
-
-    return exit_code;
+    printf("firewall-agent: shutting down\n");
+    return 0;
 }
