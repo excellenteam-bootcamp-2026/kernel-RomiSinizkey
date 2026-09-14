@@ -52,20 +52,18 @@ static const char *rules_url(void)
 }
 
 /*
- * Allocates a libnl socket, connects it to the kernel's Generic Netlink
- * bus, and resolves the "firewall" family's numeric id. The family id
- * is assigned dynamically by the kernel when firewall_module.ko
- * registers it, so it must be looked up by name at runtime rather than
- * hardcoded.
+ * Allocates a libnl socket and connects it to the kernel's Generic
+ * Netlink bus. This is the one-time, fatal part of setup: it does not
+ * depend on firewall_module.ko being loaded, only on the local netlink
+ * transport being available, so a failure here is not expected to be
+ * transient.
  *
- * On success, returns 0 with the connected socket in *sock_out and the
- * resolved family id in *family_id_out. On failure, returns a negative
- * value and leaves *sock_out as NULL.
+ * On success, returns 0 with the connected socket in *sock_out. On
+ * failure, returns a negative value and leaves *sock_out as NULL.
  */
-static int connect_netlink(struct nl_sock **sock_out, int *family_id_out)
+static int connect_netlink(struct nl_sock **sock_out)
 {
     struct nl_sock *sock;
-    int family_id;
 
     sock = nl_socket_alloc();
     if (!sock) {
@@ -79,19 +77,36 @@ static int connect_netlink(struct nl_sock **sock_out, int *family_id_out)
         return -1;
     }
 
-    family_id = genl_ctrl_resolve(sock, FIREWALL_GENL_FAMILY_NAME);
+    *sock_out = sock;
+    return 0;
+}
+
+/*
+ * Resolves the "firewall" Generic Netlink family's current numeric id
+ * on the given (already-connected) socket. The id is assigned
+ * dynamically by the kernel each time firewall_module.ko registers the
+ * family, and is not guaranteed to stay the same across an
+ * unload/reload cycle, so it is looked up fresh every sync cycle rather
+ * than cached once at startup.
+ *
+ * On success, returns the non-negative family id. On failure (module
+ * not loaded yet, or unloaded since the previous cycle), logs a clear
+ * message and returns the negative libnl error - it never terminates
+ * the process, since the module may simply not be loaded yet or may
+ * come back on a later cycle.
+ */
+static int resolve_firewall_family(struct nl_sock *sock)
+{
+    int family_id = genl_ctrl_resolve(sock, FIREWALL_GENL_FAMILY_NAME);
+
     if (family_id < 0) {
         fprintf(stderr,
             "firewall-agent: could not resolve Generic Netlink family \"%s\" "
             "(is firewall_module.ko loaded?): %s\n",
             FIREWALL_GENL_FAMILY_NAME, nl_geterror(family_id));
-        nl_socket_free(sock);
-        return family_id;
     }
 
-    *sock_out = sock;
-    *family_id_out = family_id;
-    return 0;
+    return family_id;
 }
 
 static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata)
@@ -400,19 +415,30 @@ static unsigned int poll_interval_seconds(void)
 }
 
 /*
- * Performs one fetch -> parse -> send cycle. Never terminates the
- * agent on failure - fetch_rules()/parse_rules()/send_ruleset() each
- * log their own error, and this function just returns a negative value
- * so the caller retries on the next cycle. A fetch or parse failure
- * returns before send_ruleset() is ever reached, so a bad or unreachable
- * response can never replace the kernel's active ruleset.
+ * Performs one resolve -> fetch -> parse -> send cycle. Never
+ * terminates the agent on failure - resolve_firewall_family(),
+ * fetch_rules(), parse_rules(), and send_ruleset() each log their own
+ * error, and this function just returns a negative value so the caller
+ * retries on the next cycle.
+ *
+ * The family id is re-resolved at the start of every cycle (instead of
+ * being cached once at startup) so the agent recovers automatically if
+ * the kernel module was not loaded yet, was unloaded, or was reloaded
+ * with a different family id. A resolve, fetch, or parse failure
+ * returns before send_ruleset() is ever reached, so a bad or
+ * unreachable response can never replace the kernel's active ruleset.
  */
-static int sync_once(struct nl_sock *sock, int family_id)
+static int sync_once(struct nl_sock *sock)
 {
     __be32 ips[FIREWALL_MAX_RULES];
     unsigned int count = 0;
     char *body = NULL;
+    int family_id;
     int err;
+
+    family_id = resolve_firewall_family(sock);
+    if (family_id < 0)
+        return family_id;
 
     err = fetch_rules(rules_url(), &body);
     if (err != 0)
@@ -429,7 +455,6 @@ static int sync_once(struct nl_sock *sock, int family_id)
 int main(void)
 {
     struct nl_sock *sock = NULL;
-    int family_id = 0;
     unsigned int interval;
 
     printf("firewall-agent started\n");
@@ -439,7 +464,7 @@ int main(void)
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
 
-    if (connect_netlink(&sock, &family_id) != 0) {
+    if (connect_netlink(&sock) != 0) {
         curl_global_cleanup();
         return 1;
     }
@@ -447,7 +472,7 @@ int main(void)
     printf("firewall-agent: polling every %u second(s)\n", interval);
 
     while (g_running) {
-        if (sync_once(sock, family_id) != 0)
+        if (sync_once(sock) != 0)
             fprintf(stderr, "firewall-agent: synchronization cycle failed, will retry\n");
         else
             printf("firewall-agent: synchronization cycle complete\n");
