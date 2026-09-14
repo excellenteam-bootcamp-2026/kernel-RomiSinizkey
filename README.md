@@ -406,6 +406,92 @@ the host machine, and a VM snapshot is taken before loading the module for
 the first time so the VM can be restored if it becomes unstable or
 unbootable.
 
+## Deployment: Automatic Startup (Project 12, Task 7)
+
+The kernel module and `firewall-agent` can be installed so both survive a
+VM reboot with no manual `insmod` or manual agent launch. All deployment
+files live under [`deploy/`](deploy/):
+
+```text
+deploy/
+├── systemd/firewall-agent.service   # systemd unit for the agent
+├── modules-load.d/firewall.conf     # tells systemd to modprobe the module at boot
+├── firewall-agent.env.example       # template for FIREWALL_API_URL (not installed automatically)
+└── install.sh                       # copies everything into place
+```
+
+### Build
+
+```bash
+cd kernel && make && cd ..
+cd firewall-agent && make && cd ..
+```
+
+### Install
+
+```bash
+sudo bash deploy/install.sh
+```
+
+This copies `firewall_module.ko` into `/lib/modules/$(uname -r)/extra/`,
+runs `depmod -a` so `modprobe` can resolve it, installs
+`/etc/modules-load.d/firewall.conf` (automatic module load at boot),
+installs the `firewall-agent` binary to `/usr/local/bin/`, installs the
+systemd unit, and runs `systemctl enable firewall-agent`. It does **not**
+start the service automatically — see "Configuring FIREWALL_API_URL" below
+for why.
+
+### Configuring `FIREWALL_API_URL`
+
+The service reads `FIREWALL_API_URL` from `/etc/default/firewall-agent`
+(a plain `KEY=value` file, loaded via the unit's `EnvironmentFile=`
+directive) rather than from a value baked into the `.service` file or the
+source code. This keeps the systemd unit itself reusable across
+environments — a dev VM, a different VM, or a real deployment — without
+editing tracked files or committing an environment-specific address.
+
+```bash
+sudo cp deploy/firewall-agent.env.example /etc/default/firewall-agent
+sudo nano /etc/default/firewall-agent   # uncomment and set FIREWALL_API_URL
+```
+
+For the current development setup (Node.js running on the Windows host,
+VM using VirtualBox NAT networking):
+
+```
+FIREWALL_API_URL=http://10.0.2.2:3000/api/firewall/rules?type=ip
+```
+
+`/etc/default/firewall-agent` is not tracked in git — only the `.example`
+template is.
+
+### Verifying module auto-load
+
+```bash
+sudo modprobe firewall_module      # manual check without waiting for a reboot
+lsmod | grep firewall_module
+sudo dmesg | grep firewall_module
+```
+
+### Controlling the service
+
+```bash
+sudo systemctl start firewall-agent
+sudo systemctl status firewall-agent
+sudo systemctl stop firewall-agent
+sudo systemctl restart firewall-agent
+sudo journalctl -u firewall-agent -f
+```
+
+### Reboot verification
+
+```bash
+sudo reboot
+# after the VM comes back up, with no manual commands:
+lsmod | grep firewall_module          # module auto-loaded
+sudo systemctl status firewall-agent  # active (running), started automatically
+```
+
 ## Appendix: Exploring System Calls with `strace`
 
 As part of investigating how user-space programs interact with the kernel,

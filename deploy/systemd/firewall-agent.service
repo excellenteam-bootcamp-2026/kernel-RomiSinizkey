@@ -1,0 +1,14 @@
+[Unit]
+Description=Firewall Agent - synchronizes kernel firewall rules from the Node.js API
+After=network-online.target systemd-modules-load.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/firewall-agent
+ExecStart=/usr/local/bin/firewall-agent
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
